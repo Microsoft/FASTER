@@ -307,12 +307,14 @@ class AsyncPendingRmwContext : public PendingContext<K> {
  public:
   typedef K key_t;
  protected:
-  AsyncPendingRmwContext(IAsyncContext& caller_context_, AsyncCallback caller_callback_)
-    : PendingContext<key_t>(OperationType::RMW, caller_context_, caller_callback_) {
+  AsyncPendingRmwContext(IAsyncContext& caller_context_, AsyncCallback caller_callback_, bool create_if_not_exists_)
+    : PendingContext<key_t>(OperationType::RMW, caller_context_, caller_callback_)
+    , create_if_not_exists{create_if_not_exists_} {
   }
   /// The deep copy constructor.
   AsyncPendingRmwContext(AsyncPendingRmwContext& other, IAsyncContext* caller_context)
-    : PendingContext<key_t>(other, caller_context) {
+    : PendingContext<key_t>(other, caller_context)
+    , create_if_not_exists{other.create_if_not_exists} {
   }
  public:
   /// Set initial value.
@@ -325,6 +327,9 @@ class AsyncPendingRmwContext : public PendingContext<K> {
   virtual uint32_t value_size() const = 0;
   /// Get value size for RCU
   virtual uint32_t value_size(const void* old_rec) const = 0;
+
+  /// If false, it will return NOT_FOUND instead of creating a new record
+  bool create_if_not_exists;
 };
 
 /// A synchronous Rmw() context preserves its type information.
@@ -338,8 +343,8 @@ class PendingRmwContext : public AsyncPendingRmwContext<typename MC::key_t> {
   typedef Record<key_t, value_t> record_t;
   constexpr static const bool kIsShallowKey = !std::is_same<key_or_shallow_key_t, key_t>::value;
 
-  PendingRmwContext(rmw_context_t& caller_context_, AsyncCallback caller_callback_)
-    : AsyncPendingRmwContext<key_t>(caller_context_, caller_callback_) {
+  PendingRmwContext(rmw_context_t& caller_context_, AsyncCallback caller_callback_, bool create_if_not_exists_)
+    : AsyncPendingRmwContext<key_t>(caller_context_, caller_callback_, create_if_not_exists_) {
   }
   /// The deep copy constructor.
   PendingRmwContext(PendingRmwContext& other, IAsyncContext* caller_context_)
@@ -543,6 +548,32 @@ class PendingExistsContext : public AsyncPendingExistsContext<typename MC::key_t
   inline bool is_key_equal(const key_t& other) const final {
     return exists_context().key() == other;
   }
+};
+
+
+/// FASTER's internal ConditionalCopyToTail() base context.
+/// Used in Compaction and HC's Rmw operation
+template<class K>
+class CopyToTailContextBase {
+ public:
+  typedef K key_t;
+
+ protected:
+  CopyToTailContextBase(HashBucketEntry expected_entry_, void* dest_store_)
+    : expected_entry{ expected_entry_ }
+    , dest_store{ dest_store_ }
+  {}
+
+  virtual inline const key_t& key() const = 0;
+  virtual uint32_t key_size() const = 0;
+  virtual KeyHash get_key_hash() const = 0;
+  virtual bool is_key_equal(const key_t& other) const = 0;
+  virtual uint32_t value_size() const = 0;
+  virtual bool copy_at(void* dest, uint32_t alloc_size) const = 0;
+
+ public:
+  HashBucketEntry expected_entry;
+  void* dest_store;
 };
 
 class AsyncIOContext;
