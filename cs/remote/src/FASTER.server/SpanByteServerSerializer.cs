@@ -58,6 +58,17 @@ namespace FASTER.server
         }
 
         /// <inheritdoc />
+        public bool Write(ref SpanByte k, ref byte* dst, int length)
+        {
+            if (k.Length > length) return false;
+
+            var dest = new SpanByte(length, (IntPtr)dst);
+            k.CopyTo(ref dest);
+            return true;
+        }
+
+
+        /// <inheritdoc />
         public bool Write(ref SpanByteAndMemory k, ref byte* dst, int length)
         {
             if (k.Length > length) return false;
