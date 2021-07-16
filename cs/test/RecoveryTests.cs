@@ -20,68 +20,87 @@ namespace FASTER.test.recovery.sumstore
         const long checkpointInterval = (1L << 16);
 
         private FasterKV<AdId, NumClicks> fht;
-        private string test_path;
-        private List<Guid> logTokens, indexTokens;
+        private string path;
+        private readonly List<Guid> logTokens = new();
+        private readonly List<Guid> indexTokens = new();
         private IDevice log;
 
         [SetUp]
         public void Setup()
         {
-            if (test_path == null)
-            {
-                test_path = TestContext.CurrentContext.TestDirectory + "/" + Path.GetRandomFileName();
-                if (!Directory.Exists(test_path))
-                    Directory.CreateDirectory(test_path);
-            }
+            path = TestUtils.MethodTestDir + "/";
 
-            log = Devices.CreateLogDevice(test_path + "/FullRecoveryTests.log");
+            // Only clean these in the initial Setup, as tests use the other Setup() overload to recover
+            logTokens.Clear();
+            indexTokens.Clear();
+            TestUtils.DeleteDirectory(path, true);
+        }
 
+        private void Setup(TestUtils.DeviceType deviceType)
+        {
+            log = TestUtils.CreateTestDevice(deviceType, path + "Test.log");
             fht = new FasterKV<AdId, NumClicks>
             (keySpace,
-                new LogSettings {LogDevice = log},
-                new CheckpointSettings {CheckpointDir = test_path, CheckPointType = CheckpointType.Snapshot}
+                //new LogSettings { LogDevice = log, MemorySizeBits = 14, PageSizeBits = 9 },  // locks ups at session.RMW line in Populate() for Local Memory
+                new LogSettings { LogDevice = log, SegmentSizeBits = 25 },
+                new CheckpointSettings { CheckpointDir = path, CheckPointType = CheckpointType.Snapshot }
             );
         }
 
         [TearDown]
-        public void TearDown()
+        public void TearDown() => TearDown(deleteDir: true);
+
+        private void TearDown(bool deleteDir)
         {
-            fht.Dispose();
+            fht?.Dispose();
             fht = null;
-            log.Dispose();
-            TestUtils.DeleteDirectory(test_path);
+            log?.Dispose();
+            log = null;
+
+            // Do NOT clean up here unless specified, as tests use this TearDown() to prepare for recovery
+            if (deleteDir)
+            {
+                logTokens.Clear();
+                indexTokens.Clear();
+                TestUtils.DeleteDirectory(path);
+            }
+        }
+
+        private void PrepareToRecover(TestUtils.DeviceType deviceType)
+        {
+            TearDown(deleteDir: false);
+            Setup(deviceType);
         }
 
         [Test]
         [Category("FasterKV")]
-        public async ValueTask RecoveryTestSeparateCheckpoint([Values]bool isAsync)
+        [Category("CheckpointRestore")]
+        public async ValueTask RecoveryTestSeparateCheckpoint([Values]bool isAsync, [Values] TestUtils.DeviceType deviceType)
         {
+            Setup(deviceType);
             Populate(SeparateCheckpointAction);
 
             for (var i = 0; i < logTokens.Count; i++)
             {
                 if (i >= indexTokens.Count) break;
-                fht.Dispose();
-                fht = null;
-                log.Dispose();
-                Setup();
-                await RecoverAndTestAsync(logTokens[i], indexTokens[i], isAsync);
+                PrepareToRecover(deviceType);
+                await RecoverAndTestAsync(i, isAsync);
             }
         }
 
         [Test]
         [Category("FasterKV")]
-        public async ValueTask RecoveryTestFullCheckpoint([Values] bool isAsync)
+        [Category("CheckpointRestore")]
+        [Category("Smoke")]
+        public async ValueTask RecoveryTestFullCheckpoint([Values] bool isAsync, [Values] TestUtils.DeviceType deviceType)
         {
+            Setup(deviceType);
             Populate(FullCheckpointAction);
 
-            foreach (var token in logTokens)
+            for (var i = 0; i < logTokens.Count; i++)
             {
-                fht.Dispose();
-                fht = null;
-                log.Dispose();
-                Setup();
-                await RecoverAndTestAsync(token, token, isAsync);
+                PrepareToRecover(deviceType);
+                await RecoverAndTestAsync(i, isAsync);
             }
         }
 
@@ -97,7 +116,7 @@ namespace FASTER.test.recovery.sumstore
                 logTokens.Add(token);
                 indexTokens.Add(token);
 
-                fht.CompleteCheckpointAsync().GetAwaiter().GetResult();
+                fht.CompleteCheckpointAsync().AsTask().GetAwaiter().GetResult();
             }
         }
 
@@ -114,7 +133,7 @@ namespace FASTER.test.recovery.sumstore
                 }
 
                 logTokens.Add(token);
-                fht.CompleteCheckpointAsync().GetAwaiter().GetResult();
+                fht.CompleteCheckpointAsync().AsTask().GetAwaiter().GetResult();
             }
             else
             {
@@ -124,14 +143,12 @@ namespace FASTER.test.recovery.sumstore
                 }
 
                 indexTokens.Add(token);
-                fht.CompleteCheckpointAsync().GetAwaiter().GetResult();
+                fht.CompleteCheckpointAsync().AsTask().GetAwaiter().GetResult();
             }
         }
 
         public void Populate(Action<int> checkpointAction)
         {
-            logTokens = new List<Guid>();
-            indexTokens = new List<Guid>();
             // Prepare the dataset
             var inputArray = new AdInput[numOps];
             for (int i = 0; i < numOps; i++)
@@ -158,18 +175,18 @@ namespace FASTER.test.recovery.sumstore
 
             // Make sure operations are completed
             session.CompletePending(true);
-
-            // Deregister thread from FASTER
-            session.Dispose();
         }
 
-        public async ValueTask RecoverAndTestAsync(Guid cprVersion, Guid indexVersion, bool isAsync)
+        public async ValueTask RecoverAndTestAsync(int tokenIndex, bool isAsync)
         {
+            var logToken = logTokens[tokenIndex];
+            var indexToken = indexTokens[tokenIndex];
+
             // Recover
             if (isAsync)
-                await fht.RecoverAsync(indexVersion, cprVersion);
+                await fht.RecoverAsync(indexToken, logToken);
             else
-                fht.Recover(indexVersion, cprVersion);
+                fht.Recover(indexToken, logToken);
 
             // Create array for reading
             var inputArray = new AdInput[numUniqueKeys];
@@ -189,7 +206,7 @@ namespace FASTER.test.recovery.sumstore
             for (var i = 0; i < numUniqueKeys; i++)
             {
                 var status = session.Read(ref inputArray[i].adId, ref input, ref output, Empty.Default, i);
-                Assert.IsTrue(status == Status.OK);
+                Assert.AreEqual(Status.OK, status, $"At tokenIndex {tokenIndex}, keyIndex {i}, AdId {inputArray[i].adId.adId}");
                 inputArray[i].numClicks = output.value;
             }
 
@@ -201,11 +218,11 @@ namespace FASTER.test.recovery.sumstore
 
             // Test outputs
             var checkpointInfo = default(HybridLogRecoveryInfo);
-            checkpointInfo.Recover(cprVersion,
+            checkpointInfo.Recover(logToken,
                 new DeviceLogCommitCheckpointManager(
                     new LocalStorageNamedDeviceFactory(),
                         new DefaultCheckpointNamingScheme(
-                          new DirectoryInfo(test_path).FullName)));
+                          new DirectoryInfo(path).FullName)));
 
             // Compute expected array
             long[] expected = new long[numUniqueKeys];
@@ -234,10 +251,7 @@ namespace FASTER.test.recovery.sumstore
             // Assert if expected is same as found
             for (long i = 0; i < numUniqueKeys; i++)
             {
-                Assert.IsTrue(
-                    expected[i] == inputArray[i].numClicks.numClicks,
-                    "Debug error for AdId {0}: Expected ({1}), Found({2})", inputArray[i].adId.adId, expected[i],
-                    inputArray[i].numClicks.numClicks);
+                Assert.AreEqual(expected[i], inputArray[i].numClicks.numClicks, $"At keyIndex {i}, AdId {inputArray[i].adId.adId}");
             }
         }
     }
